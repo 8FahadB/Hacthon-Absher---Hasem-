@@ -1,0 +1,50 @@
+import { randomUUID } from "crypto";
+export interface Message {
+  id: string;
+  originalText: string;
+  summary: string;
+  summaryAudioBase64?: string;
+  timestamp: Date;
+  status: "processed" | "error";
+}
+export interface InsertMessage {
+  originalText: string;
+  summary: string;
+  summaryAudioBase64?: string;
+  status: "processed" | "error";
+}
+export interface IStorage {
+  getMessages(): Promise<Message[]>;
+  getMessage(id: string): Promise<Message | undefined>;
+  createMessage(message: InsertMessage): Promise<Message>;
+  deleteMessage(id: string): Promise<void>;
+}
+export class MemStorage implements IStorage {
+  private messages: Map<string, Message>;
+  constructor() {
+    this.messages = new Map();
+  }
+  async getMessages(): Promise<Message[]> {
+    return Array.from(this.messages.values()).sort(
+      (a, b) => b.timestamp.getTime() - a.timestamp.getTime()
+    );
+  }
+  async getMessage(id: string): Promise<Message | undefined> {
+    return this.messages.get(id);
+  }
+  async createMessage(insertMessage: InsertMessage): Promise<Message> {
+    const id = randomUUID();
+    const message: Message = {
+      ...insertMessage,
+      id,
+      timestamp: new Date(),
+    };
+    this.messages.set(id, message);
+    return message;
+  }
+  async deleteMessage(id: string): Promise<void> {
+    this.messages.delete(id);
+  }
+}
+export const storage = new MemStorage();
+

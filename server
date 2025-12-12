@@ -1,0 +1,343 @@
+import OpenAI from "openai";
+import fs from "fs";
+function getOpenAIClient(): OpenAI {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("مفتاح OpenAI API غير موجود. يرجى إضافة OPENAI_API_KEY");
+  }
+  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+}
+export interface TacticalExtraction {
+  command: string;
+  direction: string;
+  location: string;
+  target: string;
+  friendlyTarget: string;
+  enemyPresence: string;
+  urgency: "عاجل" | "عادي" | "غير محدد";
+  confidence: "مؤكد" | "محتمل" | "غير مؤكد";
+  notes: string;
+  originalQuotes: string[];
+  summary: string;
+  validationIssues: string[];
+  isValidated: boolean;
+}
+export interface AnalysisResult {
+  originalText: string;
+  extraction: TacticalExtraction;
+  summary: string;
+  summaryAudioBase64?: string;
+}
+export async function transcribeAudio(audioFilePath: string): Promise<string> {
+  const openai = getOpenAIClient();
+  const audioReadStream = fs.createReadStream(audioFilePath);
+  const transcription = await openai.audio.transcriptions.create({
+    file: audioReadStream,
+    model: "whisper-1",
+    language: "ar",
+  });
+  return transcription.text;
+}
+function normalizeArabic(text: string): string {
+  return text
+    .replace(/[\u064B-\u065F]/g, "")
+    .replace(/أ|إ|آ/g, "ا")
+    .replace(/ة/g, "ه")
+    .replace(/ى/g, "ي")
+    .replace(/[ً-ٖ]/g, "")
+    .toLowerCase()
+    .trim();
+}
+const COMPOUND_DIRECTIONS = [
+  "الجنوب الشرقي", "الجنوب الغربي", "الشمال الشرقي", "الشمال الغربي",
+  "جنوب شرق", "جنوب غرب", "شمال شرق", "شمال غرب",
+];
+const SIMPLE_DIRECTIONS = ["شمال", "جنوب", "شرق", "غرب", "الشمال", "الجنوب", "الشرق", "الغرب", "الشمالية", "الجنوبية", "الشرقية", "الغربية"];
+const ALL_DIRECTIONS = [...COMPOUND_DIRECTIONS, ...SIMPLE_DIRECTIONS];
+const NEGATION_WORDS = ["لا", "لن", "ما", "ليس", "بدون", "عدم"];
+function findExactWord(word: string, text: string): boolean {
+  const normalizedWord = normalizeArabic(word);
+  const normalizedText = normalizeArabic(text);
+  
+  // For multi-word phrases (like locations), check if all words exist
+  if (normalizedWord.includes(" ")) {
+    const words = normalizedWord.split(" ");
+    return words.every(w => normalizedText.includes(w));
+  }
+  
+  // For single words, use flexible matching with Arabic prefixes
+  const wordPattern = new RegExp(`(^|\\s|ب|لل|ال|و|ف|ل)${normalizedWord}(\\s|$|ي|ه|ا|ة)`, "i");
+  return wordPattern.test(normalizedText);
+}
+function checkNegation(field: string, text: string): boolean {
+  const normalizedText = normalizeArabic(text);
+  
+  for (const negWord of NEGATION_WORDS) {
+    const pattern = new RegExp(`${normalizeArabic(negWord)}\\s+.*${normalizeArabic(field)}`, "i");
+    if (pattern.test(normalizedText)) {
+      return true;
+    }
+  }
+  return false;
+}
+function validateQuoteContainsFields(quote: string, extraction: TacticalExtraction): { valid: boolean; issues: string[] } {
+  const issues: string[] = [];
+  
+  if (extraction.direction !== "غير مذكور") {
+    const dirFound = ALL_DIRECTIONS.some((dir: string) => {
+      const normalizedDir = normalizeArabic(dir);
+      const normalizedExtDir = normalizeArabic(extraction.direction);
+      if (normalizedDir.includes(normalizedExtDir) || normalizedExtDir.includes(normalizedDir)) {
+        return findExactWord(dir, quote);
+      }
+      return false;
+    }) || findExactWord(extraction.direction, quote);
+    
+    if (!dirFound) {
+      issues.push(`الاتجاه "${extraction.direction}" غير موجود في الاقتباس`);
+    }
+    
+    if (checkNegation(extraction.direction, quote)) {
+      issues.push(`الاتجاه "${extraction.direction}" منفي في الاقتباس`);
+    }
+  }
+  
+  if (extraction.target !== "غير مذكور") {
+    if (!findExactWord(extraction.target, quote)) {
+      issues.push(`الهدف "${extraction.target}" غير موجود في الاقتباس`);
+    }
+  }
+  
+  if (extraction.command !== "غير مذكور") {
+    if (!findExactWord(extraction.command, quote)) {
+      issues.push(`الأمر "${extraction.command}" غير موجود في الاقتباس`);
+    }
+    if (checkNegation(extraction.command, quote)) {
+      issues.push(`الأمر "${extraction.command}" منفي في الاقتباس`);
+    }
+  }
+  
+  if (extraction.location !== "غير مذكور") {
+    if (!findExactWord(extraction.location, quote)) {
+      issues.push(`الموقع "${extraction.location}" غير موجود في الاقتباس`);
+    }
+  }
+  
+  return { valid: issues.length === 0, issues };
+}
+function countDirectionsInText(text: string): number {
+  const normalizedText = normalizeArabic(text);
+  
+  for (const compound of COMPOUND_DIRECTIONS) {
+    if (normalizedText.includes(normalizeArabic(compound))) {
+      return 1;
+    }
+  }
+  
+  let count = 0;
+  const foundDirs: string[] = [];
+  for (const dir of SIMPLE_DIRECTIONS) {
+    if (findExactWord(dir, text) && !foundDirs.some(f => normalizeArabic(dir).includes(normalizeArabic(f)) || normalizeArabic(f).includes(normalizeArabic(dir)))) {
+      foundDirs.push(dir);
+      count++;
+    }
+  }
+  return count;
+}
+function validateExtraction(extraction: TacticalExtraction, originalText: string): TacticalExtraction {
+  const issues: string[] = [];
+  let confidence = extraction.confidence;
+  let isValidated = true;
+  
+  const directionCount = countDirectionsInText(originalText);
+  if (directionCount > 1 && extraction.direction !== "غير مذكور") {
+    issues.push(`تحذير: النص يحتوي على ${directionCount} اتجاهات - تحقق يدوياً من الاتجاه الصحيح`);
+    confidence = "غير مؤكد";
+    isValidated = false;
+  }
+  const bestQuote = extraction.originalQuotes.find(q => 
+    normalizeArabic(originalText).includes(normalizeArabic(q))
+  );
+  
+  if (!bestQuote) {
+    issues.push("الاقتباس غير موجود في النص الأصلي");
+    confidence = "غير مؤكد";
+    isValidated = false;
+  } else {
+    const quoteValidation = validateQuoteContainsFields(bestQuote, extraction);
+    if (!quoteValidation.valid) {
+      issues.push(...quoteValidation.issues);
+      confidence = "غير مؤكد";
+      isValidated = false;
+    }
+  }
+  // Keep the built summary - don't overwrite with quote
+  return {
+    ...extraction,
+    confidence: confidence as "مؤكد" | "محتمل" | "غير مؤكد",
+    validationIssues: issues,
+    isValidated: isValidated && issues.length === 0,
+  };
+}
+export async function extractTacticalInfo(text: string): Promise<TacticalExtraction> {
+  const openai = getOpenAIClient();
+  
+  const systemPrompt = `أنت محلل اتصالات عسكرية تكتيكية. مهمتك استخراج المعلومات وإنتاج ملخص شديد الإيجاز.
+قواعد الملخص (مهم جداً):
+1. الملخص يجب أن يكون 15-25 كلمة فقط كحد أقصى
+2. لا تنسخ النص الأصلي - اختصره بشكل كبير
+3. استخدم عبارات مركبة: "توزيع مراقبين على 3 بوابات" بدلاً من تكرار كل أمر
+4. اذكر الأسماء والمواقع بإيجاز: "سعد/خالد/سعود → ألف/باء/جيم"
+5. لا تضف تفاصيل ثانوية - فقط جوهر المهمة
+استخرج بصيغة JSON:
+{
+  "command": "الفعل الرئيسي",
+  "direction": "الاتجاه أو غير مذكور",
+  "location": "المكان/المواقع",
+  "friendlyTarget": "الأشخاص المعنيون أو غير مذكور",
+  "enemyPresence": "نعم/لا",
+  "urgency": "عاجل/عادي/غير محدد",
+  "confidence": "مؤكد/محتمل/غير مؤكد",
+  "notes": "تفاصيل إضافية",
+  "originalQuotes": ["النص كاملاً"],
+  "summary": "ملخص مختصر جداً (15-25 كلمة) يوصل الفكرة الأساسية"
+}
+مثال 1:
+النص: "يرجى التوجه للبوابة الشرقية لدعم زملائك الجنود الدعم مطلوب بشكل عاجل"
+الملخص: "دعم الزملاء بالبوابة الشرقية - عاجل"
+مثال 2:
+النص: "سعد توجه فورا الى بوابة ألف وتولى المراقبة هناك خالد انتقل الى بوابة باء وثبت موقعك دون تأخير سعود اتجه الى بوابة جيم وراقب الحركة بدقة ابلغوا مباشرة عن اي امر غير طبيعي"
+الملخص: "توزيع مراقبين: سعد/خالد/سعود على بوابات ألف/باء/جيم - إبلاغ فوري"
+مثال 3:
+النص: "فريق ألفا تقدم نحو المبنى الشمالي فريق براڤو غطِّ الجناح الأيسر فريق تشارلي ابق في موقعك للاحتياط"
+الملخص: "3 فرق: ألفا→شمال، براڤو→غطاء أيسر، تشارلي→احتياط"`;
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `استخرج المعلومات التكتيكية من النص التالي:\n\n${text}` },
+    ],
+    response_format: { type: "json_object" },
+    max_tokens: 800,
+    temperature: 0,
+  });
+  const content = response.choices[0].message.content || "{}";
+  
+  try {
+    const parsed = JSON.parse(content);
+    
+    // Build concise tactical summary - command + location/direction + context + urgency
+    const summaryParts: string[] = [];
+    
+    // Command (normalize to imperative form)
+    const command = parsed.command || "";
+    if (command && command !== "غير مذكور") {
+      // Normalize: "التوجه" -> "توجه", "يرجى التوجه" -> "توجه"
+      const normalizedCmd = command.replace(/^(يرجى |ال)/, "");
+      summaryParts.push(normalizedCmd);
+    }
+    
+    // Location
+    if (parsed.location && parsed.location !== "غير مذكور") {
+      summaryParts.push(`إلى ${parsed.location}`);
+    }
+    
+    // Direction (only if no location)
+    if (parsed.direction && parsed.direction !== "غير مذكور" && (!parsed.location || parsed.location === "غير مذكور")) {
+      summaryParts.push(`باتجاه ${parsed.direction}`);
+    }
+    
+    // Friendly Target (who to support) - only if mentioned
+    if (parsed.friendlyTarget && parsed.friendlyTarget !== "غير مذكور") {
+      summaryParts.push(`لدعم ${parsed.friendlyTarget}`);
+    }
+    
+    // Enemy Presence (threat warning) - CRITICAL: enemy is a threat, not target to support!
+    if (parsed.enemyPresence === "نعم") {
+      summaryParts.push("- العدو متواجد");
+    }
+    
+    // Urgency
+    if (parsed.urgency === "عاجل") {
+      summaryParts.push("- عاجل");
+    }
+    
+    // Use GPT's summary if available (better for multiple commands), fallback to built summary
+    const builtSummary = summaryParts.length > 0 ? summaryParts.join(" ") : text;
+    const finalSummary = parsed.summary || builtSummary;
+    
+    const extraction: TacticalExtraction = {
+      command: parsed.command || "غير مذكور",
+      direction: parsed.direction || "غير مذكور",
+      location: parsed.location || "غير مذكور",
+      target: parsed.friendlyTarget || "غير مذكور",
+      friendlyTarget: parsed.friendlyTarget || "غير مذكور",
+      enemyPresence: parsed.enemyPresence || "لا",
+      urgency: parsed.urgency || "غير محدد",
+      confidence: parsed.confidence || "غير مؤكد",
+      notes: parsed.notes || "",
+      originalQuotes: parsed.originalQuotes || [],
+      summary: finalSummary,
+      validationIssues: [],
+      isValidated: false,
+    };
+    
+    return validateExtraction(extraction, text);
+  } catch {
+    return {
+      command: "غير مذكور",
+      direction: "غير مذكور",
+      location: "غير مذكور",
+      target: "غير مذكور",
+      friendlyTarget: "غير مذكور",
+      enemyPresence: "لا",
+      urgency: "غير محدد",
+      confidence: "غير مؤكد",
+      notes: "",
+      originalQuotes: [text],
+      summary: text,
+      validationIssues: ["فشل في تحليل الاستجابة - استخدم النص الأصلي"],
+      isValidated: false,
+    };
+  }
+}
+export async function textToSpeech(text: string): Promise<Buffer> {
+  const openai = getOpenAIClient();
+  const mp3 = await openai.audio.speech.create({
+    model: "tts-1",
+    voice: "onyx",
+    input: text,
+    speed: 1.0,
+  });
+  const buffer = Buffer.from(await mp3.arrayBuffer());
+  return buffer;
+}
+export async function analyzeAudio(audioFilePath: string, skipTTS: boolean = false): Promise<AnalysisResult> {
+  const originalText = await transcribeAudio(audioFilePath);
+  
+  if (!originalText.trim()) {
+    throw new Error("لم يتم التعرف على أي كلام في التسجيل");
+  }
+  const extraction = await extractTacticalInfo(originalText);
+  
+  let summaryAudioBase64: string | undefined;
+  
+  // Generate TTS only if not skipped (for faster initial response)
+  if (!skipTTS) {
+    try {
+      const summaryAudioBuffer = await textToSpeech(extraction.summary);
+      summaryAudioBase64 = summaryAudioBuffer.toString("base64");
+    } catch (error) {
+      console.error("TTS error:", error);
+    }
+  }
+  return {
+    originalText,
+    extraction,
+    summary: extraction.summary,
+    summaryAudioBase64,
+  };
+}
+export async function generateSpeech(text: string): Promise<string> {
+  const buffer = await textToSpeech(text);
+  return buffer.toString("base64");
+}
